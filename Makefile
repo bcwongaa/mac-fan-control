@@ -1,27 +1,17 @@
 APP      = FanControl
 BUILD    = .build
-BUNDLE   = $(BUILD)/$(APP).app
-BINARY   = $(BUNDLE)/Contents/MacOS/$(APP)
-PLIST    = $(BUNDLE)/Contents/Info.plist
 
 SOURCES  = $(shell find Sources -name "*.swift")
 
 .PHONY: all run clean test
 
-# ── Build app bundle ──────────────────────────────────────────────────────────
-# Target is the binary (not the bundle dir) so make correctly detects staleness.
-all: $(BINARY)
-
-$(BINARY): $(SOURCES) Resources/Info.plist
+# ── Build ─────────────────────────────────────────────────────────────────────
+all:
 	swift build -c release
-	@mkdir -p $(BUNDLE)/Contents/MacOS
-	@cp .build/release/FanControl $(BINARY)
-	@cp Resources/Info.plist $(PLIST)
-	@echo "Built $(BUNDLE)"
 
-# ── Run in-place ──────────────────────────────────────────────────────────────
+# ── Run (binary directly — preserves linker code-signature for IOKit) ─────────
 run: all
-	open $(BUNDLE)
+	$(BUILD)/release/FanControl
 
 # ── Tests (no SMC hardware required) ─────────────────────────────────────────
 test:

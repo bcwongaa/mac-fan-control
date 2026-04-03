@@ -27,9 +27,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Status Bar
 
     private func setupStatusItem() {
-        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+        // Fixed width prevents the button from resizing as the temperature text
+        // changes, which would shift the popover anchor on every open.
+        statusItem = NSStatusBar.system.statusItem(withLength: 52)
         if let button = statusItem.button {
             button.title = "—°C"
+            button.font = .monospacedDigitSystemFont(ofSize: 12, weight: .regular)
             button.action = #selector(togglePopover)
             button.target = self
         }

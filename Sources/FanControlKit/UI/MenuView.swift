@@ -41,8 +41,7 @@ struct MenuView: View {
                 actual: controller.fan0RPM,
                 target: $controller.fan0Target,
                 min: controller.fan0Min,
-                max: controller.fan0Max,
-                isAuto: controller.isAutoMode
+                max: controller.fan0Max
             ) { controller.setFan0Speed($0) }
 
             fanSlider(
@@ -50,8 +49,7 @@ struct MenuView: View {
                 actual: controller.fan1RPM,
                 target: $controller.fan1Target,
                 min: controller.fan1Min,
-                max: controller.fan1Max,
-                isAuto: controller.isAutoMode
+                max: controller.fan1Max
             ) { controller.setFan1Speed($0) }
         }
     }
@@ -100,6 +98,11 @@ struct MenuView: View {
             Button("Auto") { controller.resetToAutomatic() }
                 .help("Let Apple SMC manage fan speeds automatically")
             Spacer()
+            Button("SMC Dump") { controller.copySmcDump() }
+                .help("Copy all SMC keys/types/values to clipboard for debugging")
+                .font(.system(size: 11))
+                .foregroundColor(.secondary)
+            Spacer()
             Button("Quit") { NSApp.terminate(nil) }
         }
         .font(.system(size: 12))
@@ -135,7 +138,6 @@ struct MenuView: View {
         target: Binding<Double>,
         min: Double,
         max: Double,
-        isAuto: Bool,
         onCommit: @escaping (Double) -> Void
     ) -> some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -163,7 +165,6 @@ struct MenuView: View {
                 ) { editing in
                     if !editing { onCommit(target.wrappedValue) }
                 }
-                .disabled(isAuto)
                 Text("\(Int(max))").font(.system(size: 9)).foregroundColor(.secondary)
             }
         }

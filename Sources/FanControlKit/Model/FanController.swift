@@ -1,7 +1,7 @@
+import AppKit
 import Foundation
 import Combine
 
-/// All mutations happen on the main thread; @Published properties drive SwiftUI.
 final class FanController: ObservableObject {
 
     // MARK: - Published State
@@ -9,24 +9,22 @@ final class FanController: ObservableObject {
     @Published var cpuTemperature: Double?
     @Published var gpuTemperature: Double?
 
-    @Published var fan0RPM: Double?     // left fan actual
-    @Published var fan1RPM: Double?     // right fan actual
+    @Published var fan0RPM: Double?
+    @Published var fan1RPM: Double?
 
     @Published var fan0Target: Double = 0
     @Published var fan1Target: Double = 0
 
-    /// True when we haven't successfully written a custom speed yet.
     @Published var isAutoMode: Bool = true
 
     @Published var profiles: [FanProfile] = []
 
-    /// Non-fatal warning surfaced in the UI (e.g. Apple Silicon write restriction).
     @Published var warningMessage: String?
 
-    // Fan RPM range (read once at launch from SMC)
-    private(set) var fan0Min: Double = 1000
+    // Fan RPM range (read once at launch)
+    private(set) var fan0Min: Double = 0
     private(set) var fan0Max: Double = 6500
-    private(set) var fan1Min: Double = 1000
+    private(set) var fan1Min: Double = 0
     private(set) var fan1Max: Double = 6500
 
     // MARK: - Private
@@ -42,57 +40,109 @@ final class FanController: ObservableObject {
 
     // MARK: - Polling
 
-    /// Call on the main thread every ~3 s to refresh readings.
     func refresh() {
-        // CPU temperature — try die first, fall back to proximity
-        cpuTemperature = (try? smc.readTemperature(key: TempKey.cpuDie))
-                      ?? (try? smc.readTemperature(key: TempKey.cpuProximity))
+        // CPU — max across all cores, filtering out sleep-state garbage (< 10°C)
+        cpuTemperature = maxReading(from: TempKey.cpuPerfAll + TempKey.cpuEffAll
+                                        + [TempKey.cpuDie, TempKey.cpuProximity])
 
-        // GPU temperature
-        gpuTemperature = (try? smc.readTemperature(key: TempKey.gpuDie))
-                      ?? (try? smc.readTemperature(key: TempKey.gpuProximity))
+        gpuTemperature = maxReading(from: TempKey.gpuAll
+                                        + [TempKey.gpuDie, TempKey.gpuProximity])
 
-        // Fan RPMs
         fan0RPM = try? smc.readFanRPM(key: FanKey.fan0Actual)
         fan1RPM = try? smc.readFanRPM(key: FanKey.fan1Actual)
     }
 
-    // MARK: - Fan Control
+    /// Returns the highest valid reading. Filters out deep-sleep garbage
+    /// (cores that report < 10°C or > 130°C when idle).
+    private func maxReading(from keys: [String]) -> Double? {
+        var best: Double?
+        for key in keys {
+            guard let value = try? smc.readTemperature(key: key),
+                  value > 10, value < 130 else { continue }
+            if best == nil || value > best! { best = value }
+        }
+        return best
+    }
+
+    // MARK: - Fan Control (via privileged helper)
+    //
+    // SMC writes require root on Apple Silicon. The main app calls FanHelper
+    // via osascript "do shell script ... with administrator privileges" which
+    // prompts for the admin password once.
+
+    private var helperPath: String {
+        // FanHelper is built alongside FanControl in .build/release/
+        let selfPath = ProcessInfo.processInfo.arguments[0]
+        let dir = (selfPath as NSString).deletingLastPathComponent
+        return dir + "/FanHelper"
+    }
 
     func setFan0Speed(_ rpm: Double) {
-        do {
-            try smc.writeFanRPM(key: FanKey.fan0Min, rpm: rpm)
-            fan0Target = rpm
-            isAutoMode = false
-            warningMessage = nil
-        } catch SMCError.writeNotPermitted {
-            warningMessage = "Left fan write blocked — Apple Silicon may not allow direct SMC writes on this model."
-        } catch {
-            warningMessage = "Left fan write failed: \(error.localizedDescription)"
+        runHelper(args: "set-fan 0 \(rpm)", label: "Left") { [weak self] in
+            self?.fan0Target = rpm
+            self?.isAutoMode = false
         }
     }
 
     func setFan1Speed(_ rpm: Double) {
-        do {
-            try smc.writeFanRPM(key: FanKey.fan1Min, rpm: rpm)
-            fan1Target = rpm
-            isAutoMode = false
-            warningMessage = nil
-        } catch SMCError.writeNotPermitted {
-            warningMessage = "Right fan write blocked — Apple Silicon may not allow direct SMC writes on this model."
-        } catch {
-            warningMessage = "Right fan write failed: \(error.localizedDescription)"
+        runHelper(args: "set-fan 1 \(rpm)", label: "Right") { [weak self] in
+            self?.fan1Target = rpm
+            self?.isAutoMode = false
         }
     }
 
-    /// Restore original minimum floor so SMC regains full authority.
     func resetToAutomatic() {
-        _ = try? smc.writeFanRPM(key: FanKey.fan0Min, rpm: fan0Min)
-        _ = try? smc.writeFanRPM(key: FanKey.fan1Min, rpm: fan1Min)
-        fan0Target = fan0Min
-        fan1Target = fan1Min
-        isAutoMode = true
-        warningMessage = nil
+        runHelper(args: "auto", label: "Auto") { [weak self] in
+            guard let self else { return }
+            self.fan0Target = self.fan0Min
+            self.fan1Target = self.fan1Min
+            self.isAutoMode = true
+        }
+    }
+
+    private func runHelper(args: String, label: String, onSuccess: @escaping () -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let path = self.helperPath
+            // Use osascript to prompt for admin password and run with sudo
+            let script = "do shell script \"\(path) \(args)\" with administrator privileges"
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            task.arguments = ["-e", script]
+            let pipe = Pipe()
+            task.standardOutput = pipe
+            task.standardError = pipe
+
+            do {
+                try task.run()
+                task.waitUntilExit()
+                let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+
+                DispatchQueue.main.async {
+                    if task.terminationStatus == 0 {
+                        onSuccess()
+                        self.warningMessage = nil
+                    } else {
+                        self.warningMessage = "\(label): \(output.trimmingCharacters(in: .whitespacesAndNewlines))"
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.warningMessage = "\(label): \(error.localizedDescription)"
+                }
+            }
+        }
+    }
+
+    // MARK: - Debug
+
+    func copySmcDump() {
+        let dump = smc.dumpAllKeys()
+        // Write to file and clipboard
+        let path = NSHomeDirectory() + "/Desktop/smc-dump.txt"
+        try? dump.write(toFile: path, atomically: true, encoding: .utf8)
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(dump, forType: .string)
     }
 
     // MARK: - Profiles
@@ -107,8 +157,6 @@ final class FanController: ObservableObject {
     func loadProfile(_ profile: FanProfile) {
         setFan0Speed(profile.fan0MinRPM)
         setFan1Speed(profile.fan1MinRPM)
-        fan0Target = profile.fan0MinRPM
-        fan1Target = profile.fan1MinRPM
     }
 
     func deleteProfile(_ profile: FanProfile) {

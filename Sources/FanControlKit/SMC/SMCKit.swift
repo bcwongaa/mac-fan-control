@@ -16,120 +16,76 @@ enum SMCError: Error, LocalizedError {
         case .serviceNotFound:        return "AppleSMC service not found"
         case .failedToOpen:           return "Failed to open SMC connection"
         case .keyNotFound(let key):   return "SMC key '\(key)' not found"
-        case .readFailed(let code):   return "SMC read failed (result=\(code))"
-        case .writeFailed(let code):  return "SMC write failed (result=\(code))"
+        case .readFailed(let code):   return "SMC read failed (kr=\(String(format:"0x%X", UInt32(bitPattern: code))))"
+        case .writeFailed(let code):  return "SMC write failed (kr=\(String(format:"0x%X", UInt32(bitPattern: code))))"
         case .writeNotPermitted:      return "SMC write not permitted — Apple Silicon may restrict this key"
         }
     }
 }
 
-// MARK: - Structures
+// MARK: - Raw SMC Buffer
 //
-// These structs must match the C layout the AppleSMC kernel driver expects.
-// All are plain value types so Swift gives them C-compatible memory layout.
+// The AppleSMC driver expects a specific 80-byte struct.  Rather than relying
+// on Swift's (non-guaranteed) struct padding to match the C layout, we
+// allocate a plain byte array and write each field at its known offset.
+//
+// Layout (from the canonical C definition used across all known SMC tools):
+//   0- 3  key            (UInt32, big-endian)
+//   4- 9  version        (6 bytes, mostly unused)
+//  10-11  [padding]
+//  12-27  pLimitData     (16 bytes, mostly unused)
+//  28-31  keyInfo.dataSize  (UInt32, big-endian)
+//  32-35  keyInfo.dataType  (UInt32, big-endian — four-char code)
+//     36  keyInfo.dataAttributes (UInt8)
+//  37-39  [padding]
+//     40  result         (UInt8, SMC status returned by driver)
+//     41  status         (UInt8)
+//     42  data8          (UInt8, sub-operation selector)
+//     43  [padding]
+//  44-47  data32         (UInt32, big-endian, used as key index)
+//  48-79  bytes[32]      (raw data payload)
 
-/// Alias for the 32-byte data buffer carried in SMCParamStruct.
-typealias SMCBytes = (
-    UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-    UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-    UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8,
-    UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8, UInt8
-)
+private let kBufSize = 80
 
-struct SMCVersion {
-    var major: UInt8    = 0
-    var minor: UInt8    = 0
-    var build: UInt8    = 0
-    var reserved: UInt8 = 0
-    var release: UInt16 = 0
+private enum Off {
+    static let key       = 0
+    static let infoSize  = 28
+    static let infoType  = 32
+    static let result    = 40
+    static let data8     = 42
+    static let data32    = 44
+    static let dataBytes = 48
 }
 
-struct SMCPLimitData {
-    var version:   UInt16 = 0
-    var length:    UInt16 = 0
-    var cpuPLimit: UInt32 = 0
-    var gpuPLimit: UInt32 = 0
-    var memPLimit: UInt32 = 0
+private enum Sel: UInt8 {
+    case getKeyFromIndex = 8
+    case getKeyInfo      = 9
+    case readKey         = 5
+    case writeKey        = 6
 }
 
-struct SMCKeyInfoData {
-    var dataSize:       UInt32 = 0
-    var dataType:       UInt32 = 0
-    var dataAttributes: UInt8  = 0
-}
-
-/// The main in/out struct passed to IOConnectCallStructMethod (selector 2).
-/// Sub-operation is chosen by setting `data8` to a `SMCSelector` raw value.
-struct SMCParamStruct {
-    var key         : UInt32       = 0
-    var vers        = SMCVersion()
-    var pLimitData  = SMCPLimitData()
-    var keyInfo     = SMCKeyInfoData()
-    var result      : UInt8        = 0
-    var status      : UInt8        = 0
-    var data8       : UInt8        = 0
-    var data32      : UInt32       = 0
-    var bytes       : SMCBytes     = (
-        0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0,
-        0,0,0,0,0,0,0,0, 0,0,0,0,0,0,0,0
-    )
-}
-
-/// Sub-operation selector placed in SMCParamStruct.data8.
-private enum SMCSelector: UInt8 {
-    case getKeyInfo  = 9
-    case readKey     = 5
-    case writeKey    = 6
-}
-
-// SMC result codes returned in SMCParamStruct.result
-private let kSMCKeyNotFound:   UInt8 = 0x84
-private let kSMCNotWritable:   UInt8 = 0x85
-
-// IOConnectCallStructMethod selector for all SMC operations
-private let kSMCHandleYPCEvent: UInt32 = 2
+private let kResultKeyNotFound: UInt8 = 0x84
+private let kResultNotWritable: UInt8 = 0x85
+private let kSMCYPCEvent: UInt32 = 2   // IOConnectCallStructMethod selector
 
 // MARK: - SMCKit
 
-/// Thread-unsafe; only call from main thread / @MainActor context.
 final class SMCKit {
 
     private var connection: io_connect_t = 0
     private var isOpen = false
 
-    init() {
-        try? open()
-    }
-
-    deinit {
-        close()
-    }
-
-    // MARK: - Public API
-
-    func readTemperature(key: String) throws -> Double {
-        let output = try readKey(key)
-        return decodeSP78(output.bytes)
-    }
-
-    func readFanRPM(key: String) throws -> Double {
-        let output = try readKey(key)
-        return decodeFPE2(output.bytes)
-    }
-
-    func writeFanRPM(key: String, rpm: Double) throws {
-        let encoded = encodeFPE2(rpm)
-        try writeKey(key, bytes: encoded, dataSize: 2)
-    }
+    init() { try? open() }
+    deinit { close() }
 
     // MARK: - Connection
 
     func open() throws {
         guard !isOpen else { return }
-        let service = IOServiceGetMatchingService(0, IOServiceMatching("AppleSMC"))
-        guard service != IO_OBJECT_NULL else { throw SMCError.serviceNotFound }
-        defer { IOObjectRelease(service) }
-        let kr = IOServiceOpen(service, mach_task_self_, 0, &connection)
+        let svc = IOServiceGetMatchingService(0, IOServiceMatching("AppleSMC"))
+        guard svc != IO_OBJECT_NULL else { throw SMCError.serviceNotFound }
+        defer { IOObjectRelease(svc) }
+        let kr = IOServiceOpen(svc, mach_task_self_, 0, &connection)
         guard kr == kIOReturnSuccess else { throw SMCError.failedToOpen }
         isOpen = true
     }
@@ -140,68 +96,211 @@ final class SMCKit {
         isOpen = false
     }
 
-    // MARK: - Low-level Calls
+    // MARK: - Public API
 
-    private func callSMC(_ input: inout SMCParamStruct) throws -> SMCParamStruct {
-        guard isOpen else { throw SMCError.serviceNotFound }
-        var output = SMCParamStruct()
-        var outSize = MemoryLayout<SMCParamStruct>.size
-        let kr = IOConnectCallStructMethod(
-            connection,
-            kSMCHandleYPCEvent,
-            &input,
-            MemoryLayout<SMCParamStruct>.size,
-            &output,
-            &outSize
-        )
-        guard kr == kIOReturnSuccess else { throw SMCError.readFailed(kr) }
-        return output
+    func readTemperature(key: String) throws -> Double {
+        let (dataType, bytes) = try read(key)
+        switch dataType {
+        case "flt ": return decodeFLT(bytes)
+        case "si16": return decodeSI16(bytes)
+        default:     return decodeSP78(bytes)   // sp78 + unknown
+        }
     }
 
-    private func getKeyInfo(_ key: String) throws -> SMCKeyInfoData {
-        var input = SMCParamStruct()
-        input.key  = fourCharCode(key)
-        input.data8 = SMCSelector.getKeyInfo.rawValue
-        let output = try callSMC(&input)
-        if output.result == kSMCKeyNotFound { throw SMCError.keyNotFound(key) }
-        guard output.result == 0 else { throw SMCError.readFailed(kern_return_t(output.result)) }
-        return output.keyInfo
+    func readFanRPM(key: String) throws -> Double {
+        let (dataType, bytes) = try read(key)
+        switch dataType {
+        case "flt ": return decodeFLT(bytes)
+        case "ui16": return Double(UInt16(bytes[0]) << 8 | UInt16(bytes[1]))
+        default:     return decodeFPE2(bytes)   // fpe2
+        }
     }
 
-    private func readKey(_ key: String) throws -> SMCParamStruct {
-        let info = try getKeyInfo(key)
-        var input = SMCParamStruct()
-        input.key              = fourCharCode(key)
-        input.keyInfo.dataSize = info.dataSize
-        input.data8            = SMCSelector.readKey.rawValue
-        let output = try callSMC(&input)
-        if output.result == kSMCKeyNotFound { throw SMCError.keyNotFound(key) }
-        guard output.result == 0 else { throw SMCError.readFailed(kern_return_t(output.result)) }
-        return output
+    /// Read a ui8 value (e.g. F0Md, Ftst)
+    func readUInt8(key: String) throws -> UInt8 {
+        let (_, bytes) = try read(key)
+        return bytes.first ?? 0
     }
 
-    private func writeKey(_ key: String, bytes: [UInt8], dataSize: UInt32) throws {
-        let info = try getKeyInfo(key)
-        var input = SMCParamStruct()
-        input.key              = fourCharCode(key)
-        input.keyInfo.dataSize = dataSize
-        input.keyInfo.dataType = info.dataType
-        input.data8            = SMCSelector.writeKey.rawValue
-        withUnsafeMutableBytes(of: &input.bytes) { ptr in
-            for (i, byte) in bytes.prefix(Int(dataSize)).enumerated() {
-                ptr[i] = byte
+    /// Write a ui8 value (e.g. F0Md, Ftst)
+    func writeUInt8(key: String, value: UInt8) throws {
+        try write(key, bytes: [value])
+    }
+
+    /// Write fan RPM — auto-detects type (flt on Apple Silicon, fpe2 on Intel).
+    func writeFanRPM(key: String, rpm: Double) throws {
+        let (dataType, _) = try read(key)
+        switch dataType.trimmingCharacters(in: .whitespaces) {
+        case "flt":
+            try write(key, bytes: encodeFLT(rpm))
+        default:
+            try write(key, bytes: encodeFPE2(rpm))
+        }
+    }
+
+    // MARK: - Debug Dump
+
+    /// Dump only the keys we care about (fans + temps + control keys).
+    func dumpAllKeys() -> String {
+        guard isOpen else { return "SMC not open" }
+
+        let keysToCheck = [
+            "FNum", "F0Ac", "F1Ac", "F0Mn", "F1Mn", "F0Mx", "F1Mx",
+            "F0Tg", "F1Tg", "F0Md", "F1Md", "F0Sf", "F1Sf", "Ftst",
+            "Tp01", "Tp05", "Tp09", "Tp0D", "Tp0X", "Tp0b", "Tp0f", "Tp0j",
+            "Tp1h", "Tp1t", "Tp1p", "Tp1l",
+            "Tg0f", "Tg0j",
+            "TC0P", "TC0D", "TG0P", "TG0D",
+        ]
+
+        var lines = ["SMC key dump (targeted)\n"]
+
+        for key in keysToCheck {
+            do {
+                let (dataType, bytes) = try read(key)
+                let typ = dataType.trimmingCharacters(in: .whitespaces)
+                let hex = bytes.prefix(8).map { String(format: "%02X", $0) }.joined(separator: " ")
+
+                var decoded = ""
+                if typ == "flt" && bytes.count >= 4 { decoded = String(format: "%.2f", decodeFLT(bytes)) }
+                else if typ == "sp78" && bytes.count >= 2 { decoded = String(format: "%.2f °C", decodeSP78(bytes)) }
+                else if typ == "fpe2" && bytes.count >= 2 { decoded = String(format: "%.2f RPM", decodeFPE2(bytes)) }
+                else if typ == "ui8" && bytes.count >= 1 { decoded = "\(bytes[0])" }
+
+                let val = decoded.isEmpty ? hex : "\(hex) → \(decoded)"
+                lines.append("\(key)  type=\(typ)  size=\(bytes.count)  \(val)")
+            } catch {
+                lines.append("\(key)  \(error.localizedDescription)")
             }
         }
-        let output = try callSMC(&input)
-        if output.result == kSMCNotWritable { throw SMCError.writeNotPermitted }
-        guard output.result == 0 else { throw SMCError.writeFailed(kern_return_t(output.result)) }
+
+        // Also try a write test to F0Tg (read current value, write it back)
+        lines.append("\n--- Write test ---")
+        do {
+            let (typ, bytes) = try read("F0Tg")
+            lines.append("F0Tg read OK: type=\(typ.trimmingCharacters(in: .whitespaces)) bytes=\(bytes.map{String(format:"%02X",$0)}.joined(separator:" "))")
+            // Try writing the same value back
+            try write("F0Tg", bytes: bytes)
+            lines.append("F0Tg write OK (wrote same value back)")
+        } catch {
+            lines.append("F0Tg write test: \(error.localizedDescription)")
+        }
+
+        do {
+            try writeUInt8(key: "F0Md", value: 1)
+            lines.append("F0Md write 1 OK")
+            try writeUInt8(key: "F0Md", value: 0)
+            lines.append("F0Md write 0 OK (restored)")
+        } catch {
+            lines.append("F0Md write test: \(error.localizedDescription)")
+        }
+
+        return lines.joined(separator: "\n")
     }
 
-    // MARK: - Encoding / Decoding
+    // MARK: - Raw I/O
 
-    /// FPE2 (unsigned 14.2 fixed-point, big-endian):  raw = rpm × 4
-    private func decodeFPE2(_ bytes: SMCBytes) -> Double {
-        Double(UInt16(bytes.0) << 8 | UInt16(bytes.1)) / 4.0
+    private func read(_ key: String) throws -> (type: String, bytes: [UInt8]) {
+        // getKeyInfo
+        var infoBuf = makeBuf()
+        setNat32(&infoBuf, Off.key, fourCC(key))
+        infoBuf[Off.data8] = Sel.getKeyInfo.rawValue
+        let infoOut = try call(infoBuf)
+        if infoOut[Off.result] == kResultKeyNotFound { throw SMCError.keyNotFound(key) }
+        guard infoOut[Off.result] == 0 else { throw SMCError.readFailed(kern_return_t(infoOut[Off.result])) }
+
+        let dataSize = getNat32(infoOut, Off.infoSize)
+        let dataType = codeStr(getNat32(infoOut, Off.infoType))
+
+        // read
+        var rdBuf = makeBuf()
+        setNat32(&rdBuf, Off.key, fourCC(key))
+        setNat32(&rdBuf, Off.infoSize, dataSize)
+        rdBuf[Off.data8] = Sel.readKey.rawValue
+        let rdOut = try call(rdBuf)
+        if rdOut[Off.result] == kResultKeyNotFound { throw SMCError.keyNotFound(key) }
+        guard rdOut[Off.result] == 0 else { throw SMCError.readFailed(kern_return_t(rdOut[Off.result])) }
+
+        let bytes = Array(rdOut[Off.dataBytes ..< min(Off.dataBytes + Int(dataSize), kBufSize)])
+        return (dataType, bytes)
+    }
+
+    private func write(_ key: String, bytes: [UInt8]) throws {
+        // getKeyInfo to get the type
+        var infoBuf = makeBuf()
+        setNat32(&infoBuf, Off.key, fourCC(key))
+        infoBuf[Off.data8] = Sel.getKeyInfo.rawValue
+        let infoOut = try call(infoBuf)
+        if infoOut[Off.result] == kResultKeyNotFound { throw SMCError.keyNotFound(key) }
+        guard infoOut[Off.result] == 0 else { throw SMCError.readFailed(kern_return_t(infoOut[Off.result])) }
+
+        var wrBuf = makeBuf()
+        setNat32(&wrBuf, Off.key, fourCC(key))
+        setNat32(&wrBuf, Off.infoSize, UInt32(bytes.count))
+        setNat32(&wrBuf, Off.infoType, getNat32(infoOut, Off.infoType))
+        wrBuf[Off.data8] = Sel.writeKey.rawValue
+        for (i, b) in bytes.enumerated() where Off.dataBytes + i < kBufSize {
+            wrBuf[Off.dataBytes + i] = b
+        }
+        let wrOut = try call(wrBuf)
+        if wrOut[Off.result] == kResultNotWritable { throw SMCError.writeNotPermitted }
+        guard wrOut[Off.result] == 0 else { throw SMCError.writeFailed(kern_return_t(wrOut[Off.result])) }
+    }
+
+    /// Calls IOConnectCallStructMethod, throws on kern_return_t failure.
+    private func call(_ input: [UInt8]) throws -> [UInt8] {
+        guard isOpen else { throw SMCError.serviceNotFound }
+        let (kr, out) = rawCall(input)
+        guard kr == kIOReturnSuccess else {
+            throw SMCError.readFailed(kr)
+        }
+        return out
+    }
+
+    /// Calls IOConnectCallStructMethod, returns the kern_return_t and output buffer.
+    private func rawCall(_ input: [UInt8]) -> (kern_return_t, [UInt8]) {
+        var inp = input
+        var out = [UInt8](repeating: 0, count: kBufSize)
+        var outSize = kBufSize
+        let kr = inp.withUnsafeMutableBufferPointer { inBuf in
+            out.withUnsafeMutableBufferPointer { outBuf in
+                IOConnectCallStructMethod(
+                    connection, kSMCYPCEvent,
+                    inBuf.baseAddress, kBufSize,
+                    outBuf.baseAddress, &outSize
+                )
+            }
+        }
+        return (kr, out)
+    }
+
+
+    // MARK: - Buffer Helpers
+
+    private func makeBuf() -> [UInt8] { [UInt8](repeating: 0, count: kBufSize) }
+
+    /// Write UInt32 in **native** byte order (little-endian on ARM64).
+    /// The AppleSMC kernel driver stores struct fields in native endian.
+    private func setNat32(_ buf: inout [UInt8], _ offset: Int, _ value: UInt32) {
+        withUnsafeBytes(of: value) { src in
+            for i in 0..<4 { buf[offset + i] = src[i] }
+        }
+    }
+
+    /// Read UInt32 in native byte order.
+    private func getNat32(_ buf: [UInt8], _ offset: Int) -> UInt32 {
+        var val: UInt32 = 0
+        withUnsafeMutableBytes(of: &val) { dst in
+            for i in 0..<4 { dst[i] = buf[offset + i] }
+        }
+        return val
+    }
+
+    // MARK: - Encode / Decode
+
+    private func decodeFPE2(_ b: [UInt8]) -> Double {
+        guard b.count >= 2 else { return 0 }
+        return Double(UInt16(b[0]) << 8 | UInt16(b[1])) / 4.0
     }
 
     private func encodeFPE2(_ rpm: Double) -> [UInt8] {
@@ -209,18 +308,41 @@ final class SMCKit {
         return [UInt8(raw >> 8), UInt8(raw & 0xFF)]
     }
 
-    /// SP78 (signed 7.8 fixed-point, big-endian):  raw / 256.0 = °C
-    private func decodeSP78(_ bytes: SMCBytes) -> Double {
-        let raw = UInt16(bytes.0) << 8 | UInt16(bytes.1)
-        return Double(Int16(bitPattern: raw)) / 256.0
+    private func decodeSP78(_ b: [UInt8]) -> Double {
+        guard b.count >= 2 else { return 0 }
+        return Double(Int16(bitPattern: UInt16(b[0]) << 8 | UInt16(b[1]))) / 256.0
     }
 
-    // MARK: - Helpers
+    /// FLT on Apple Silicon is IEEE 754 float, **little-endian** byte order.
+    private func decodeFLT(_ b: [UInt8]) -> Double {
+        guard b.count >= 4 else { return 0 }
+        let raw = UInt32(b[0]) | UInt32(b[1]) << 8 | UInt32(b[2]) << 16 | UInt32(b[3]) << 24
+        return Double(Float(bitPattern: raw))
+    }
 
-    /// Encodes a 4-character ASCII string as a big-endian UInt32 SMC key.
-    private func fourCharCode(_ string: String) -> UInt32 {
-        string.unicodeScalars.prefix(4).enumerated().reduce(0) { acc, pair in
-            acc | (UInt32(pair.element.value) << UInt32((3 - pair.offset) * 8))
+    private func encodeFLT(_ value: Double) -> [UInt8] {
+        let raw = Float(value).bitPattern
+        return [UInt8(raw & 0xFF), UInt8((raw >> 8) & 0xFF),
+                UInt8((raw >> 16) & 0xFF), UInt8((raw >> 24) & 0xFF)]
+    }
+
+    private func decodeSI16(_ b: [UInt8]) -> Double {
+        guard b.count >= 2 else { return 0 }
+        return Double(Int16(bitPattern: UInt16(b[0]) << 8 | UInt16(b[1])))
+    }
+
+    // MARK: - Four-char Code Helpers
+
+    private func fourCC(_ s: String) -> UInt32 {
+        s.unicodeScalars.prefix(4).enumerated().reduce(0) { acc, p in
+            acc | (UInt32(p.element.value) << UInt32((3 - p.offset) * 8))
         }
+    }
+
+    private func codeStr(_ code: UInt32) -> String {
+        [24, 16, 8, 0].map { shift -> Character in
+            let b = UInt8((code >> shift) & 0xFF)
+            return b > 31 && b < 127 ? Character(UnicodeScalar(b)) : "."
+        }.reduce("") { $0 + String($1) }
     }
 }

@@ -35,6 +35,15 @@ let package = Package(
             ]
         ),
 
+        // Privileged helper — runs via sudo to write SMC fan keys.
+        .executableTarget(
+            name: "FanHelper",
+            path: "Sources/FanHelper",
+            linkerSettings: [
+                .linkedFramework("IOKit"),
+            ]
+        ),
+
         // Tests — pure-Swift logic only; no SMC hardware required.
         .testTarget(
             name: "FanControlKitTests",
