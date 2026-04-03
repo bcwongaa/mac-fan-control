@@ -3,7 +3,6 @@ import SwiftUI
 struct MenuView: View {
     @ObservedObject var controller: FanController
     @State private var newProfileName = ""
-    @State private var selectedProfileID: UUID?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -26,11 +25,8 @@ struct MenuView: View {
     // MARK: - Sections
 
     private var temperatureSection: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            sectionHeader("Temperatures", icon: "thermometer.medium")
-            row("CPU", value: controller.cpuTemperature.map { String(format: "%.1f °C", $0) } ?? "—")
-            row("GPU", value: controller.gpuTemperature.map { String(format: "%.1f °C", $0) } ?? "—")
-        }
+        row("Temp",
+            value: controller.temperature.map { String(format: "%.1f °C", $0) } ?? "—")
     }
 
     private var fanSection: some View {
@@ -61,11 +57,9 @@ struct MenuView: View {
             if !controller.profiles.isEmpty {
                 ForEach(controller.profiles) { profile in
                     HStack {
-                        Button(profile.name) {
-                            controller.loadProfile(profile)
-                        }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 12))
+                        Button(profile.name) { controller.loadProfile(profile) }
+                            .buttonStyle(.plain)
+                            .font(.system(size: 12))
                         Spacer()
                         Button {
                             controller.deleteProfile(profile)
@@ -107,10 +101,13 @@ struct MenuView: View {
                 .font(.system(size: 11))
             }
             HStack {
-                Button("SMC Dump") { controller.copySmcDump() }
-                    .help("Copy all SMC keys/types/values to clipboard for debugging")
-                    .font(.system(size: 11))
-                    .foregroundColor(.secondary)
+                if DebugFlags.showSMCDump {
+                    Button("SMC Dump") { controller.copySmcDump() }
+                        .help("Copy SMC keys/types/values to clipboard")
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                    Spacer()
+                }
                 Spacer()
                 Button("Quit") { NSApp.terminate(nil) }
             }
@@ -118,28 +115,20 @@ struct MenuView: View {
         .font(.system(size: 12))
     }
 
-    private func warningBanner(_ text: String) -> some View {
-        Text(text)
-            .font(.system(size: 10))
-            .foregroundColor(.orange)
-            .fixedSize(horizontal: false, vertical: true)
-    }
-
     // MARK: - Reusable Components
 
     private func sectionHeader(_ title: String, icon: String) -> some View {
         Label(title, systemImage: icon)
             .font(.system(size: 12, weight: .semibold))
-            .foregroundColor(.primary)
     }
 
     private func row(_ label: String, value: String) -> some View {
         HStack {
-            Text(label).foregroundColor(.secondary)
+            Label(label, systemImage: "thermometer.medium")
+                .font(.system(size: 12, weight: .semibold))
             Spacer()
-            Text(value).monospacedDigit()
+            Text(value).monospacedDigit().font(.system(size: 12))
         }
-        .font(.system(size: 12))
     }
 
     private func fanSlider(
@@ -177,6 +166,54 @@ struct MenuView: View {
                 }
                 Text("\(Int(max))").font(.system(size: 9)).foregroundColor(.secondary)
             }
+
+            RPMEntryField(min: min, max: max, onCommit: { rpm in
+                target.wrappedValue = rpm
+                onCommit(rpm)
+            })
         }
+    }
+
+    private func warningBanner(_ text: String) -> some View {
+        Text(text)
+            .font(.system(size: 10))
+            .foregroundColor(.orange)
+            .fixedSize(horizontal: false, vertical: true)
+    }
+}
+
+// MARK: - Manual RPM Entry
+
+private struct RPMEntryField: View {
+    let min: Double
+    let max: Double
+    let onCommit: (Double) -> Void
+
+    @State private var text = ""
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        HStack(spacing: 4) {
+            TextField("Set RPM…", text: $text)
+                .textFieldStyle(.roundedBorder)
+                .font(.system(size: 11).monospacedDigit())
+                .focused($focused)
+                .onSubmit { commit() }
+            Button("Set") { commit() }
+                .font(.system(size: 11))
+                .disabled(!isValid)
+        }
+    }
+
+    private var isValid: Bool {
+        Double(text.trimmingCharacters(in: .whitespaces)) != nil
+    }
+
+    private func commit() {
+        guard let rpm = Double(text.trimmingCharacters(in: .whitespaces)) else { return }
+        let clamped = Swift.min(Swift.max(rpm, min), max)
+        onCommit(clamped)
+        text = ""
+        focused = false
     }
 }

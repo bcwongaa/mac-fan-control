@@ -7,8 +7,7 @@ final class FanController: ObservableObject {
 
     // MARK: - Published State
 
-    @Published var cpuTemperature: Double?
-    @Published var gpuTemperature: Double?
+    @Published var temperature: Double?   // hottest sensor across CPU+GPU
 
     @Published var fan0RPM: Double?
     @Published var fan1RPM: Double?
@@ -66,15 +65,13 @@ final class FanController: ObservableObject {
     // MARK: - Polling
 
     func refresh() {
-        // CPU — max across all cores, filtering out sleep-state garbage (< 10°C)
-        cpuTemperature = maxReading(from: TempKey.cpuPerfAll + TempKey.cpuEffAll
-                                        + [TempKey.cpuDie, TempKey.cpuProximity])
-
-        gpuTemperature = maxReading(from: TempKey.gpuAll
-                                        + [TempKey.gpuDie, TempKey.gpuProximity])
-
-        fan0RPM = try? smc.readFanRPM(key: FanKey.fan0Actual)
-        fan1RPM = try? smc.readFanRPM(key: FanKey.fan1Actual)
+        // On Apple Silicon CPU and GPU share the same die — one unified reading.
+        // Only overwrite if we get a valid value; stale reads keep the last known temp.
+        if let t = maxReading(from: TempKey.cpuPerfAll + TempKey.cpuEffAll + TempKey.gpuAll) {
+            temperature = t
+        }
+        if let rpm = try? smc.readFanRPM(key: FanKey.fan0Actual) { fan0RPM = rpm }
+        if let rpm = try? smc.readFanRPM(key: FanKey.fan1Actual) { fan1RPM = rpm }
     }
 
     /// Returns the highest valid reading. Filters out deep-sleep garbage
