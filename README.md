@@ -1,4 +1,4 @@
-# M2 Pro Fan Control
+# Mac (M2 Pro) Fan Control
 
 > Because I don't wanna pay for Mac Fan Control.
 
