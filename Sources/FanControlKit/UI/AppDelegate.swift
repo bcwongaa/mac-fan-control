@@ -18,10 +18,13 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         setupStatusItem()
         setupPopover()
         startPolling()
+        if !controller.helperInstalled {
+            controller.installHelper { _ in }
+        }
     }
 
     public func applicationWillTerminate(_ notification: Notification) {
-        controller.resetToAutomatic()
+        controller.resetToAutomaticOnQuit()
     }
 
     // MARK: - Status Bar

@@ -1,6 +1,7 @@
 import AppKit
 import Foundation
 import Combine
+import ServiceManagement
 
 final class FanController: ObservableObject {
 
@@ -20,6 +21,8 @@ final class FanController: ObservableObject {
     @Published var profiles: [FanProfile] = []
 
     @Published var warningMessage: String?
+    @Published var helperInstalled: Bool = false
+    @Published var launchAtLogin: Bool = false
 
     // Fan RPM range (read once at launch)
     private(set) var fan0Min: Double = 0
@@ -30,12 +33,34 @@ final class FanController: ObservableObject {
     // MARK: - Private
 
     private let smc = SMCKit()
+    private let installedHelperPath = "/usr/local/bin/FanHelper"
+    private let sudoersPath = "/etc/sudoers.d/fan-control"
 
     // MARK: - Init
 
     init() {
         loadFanLimits()
         loadProfiles()
+        refreshHelperStatus()
+        launchAtLogin = SMAppService.mainApp.status == .enabled
+    }
+
+    private func refreshHelperStatus() {
+        helperInstalled = FileManager.default.fileExists(atPath: installedHelperPath) &&
+                          FileManager.default.fileExists(atPath: sudoersPath)
+    }
+
+    func setLaunchAtLogin(_ enable: Bool) {
+        do {
+            if enable {
+                try SMAppService.mainApp.register()
+            } else {
+                try SMAppService.mainApp.unregister()
+            }
+            launchAtLogin = SMAppService.mainApp.status == .enabled
+        } catch {
+            warningMessage = "Login item: \(error.localizedDescription)"
+        }
     }
 
     // MARK: - Polling
@@ -77,6 +102,50 @@ final class FanController: ObservableObject {
         return dir + "/FanHelper"
     }
 
+    // MARK: - One-time Helper Installation
+
+    /// Copies FanHelper to /usr/local/bin and writes a sudoers NOPASSWD rule so
+    /// subsequent fan writes require no password. Prompts for admin credentials once.
+    func installHelper(completion: @escaping (Error?) -> Void) {
+        let src = helperPath
+        let dst = installedHelperPath
+        let sudoers = sudoersPath
+        let escapedSrc = src.replacingOccurrences(of: "'", with: "'\\''")
+        let shellCmd = "cp '\(escapedSrc)' \(dst) && chmod 755 \(dst) && " +
+                       "echo '%admin ALL=(root) NOPASSWD: \(dst)' > \(sudoers) && " +
+                       "chmod 440 \(sudoers)"
+        let script = "do shell script \"\(shellCmd)\" with administrator privileges"
+
+        DispatchQueue.global(qos: .userInitiated).async { [weak self] in
+            guard let self else { return }
+            let task = Process()
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            task.arguments = ["-e", script]
+            let pipe = Pipe()
+            task.standardOutput = pipe
+            task.standardError = pipe
+            do {
+                try task.run()
+                task.waitUntilExit()
+                let output = String(data: pipe.fileHandleForReading.readDataToEndOfFile(),
+                                    encoding: .utf8) ?? ""
+                DispatchQueue.main.async {
+                    if task.terminationStatus == 0 {
+                        self.refreshHelperStatus()
+                        completion(nil)
+                    } else {
+                        completion(NSError(
+                            domain: "FanControl", code: Int(task.terminationStatus),
+                            userInfo: [NSLocalizedDescriptionKey:
+                                output.trimmingCharacters(in: .whitespacesAndNewlines)]))
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async { completion(error) }
+            }
+        }
+    }
+
     func setFan0Speed(_ rpm: Double) {
         runHelper(args: "set-fan 0 \(rpm)", label: "Left") { [weak self] in
             self?.fan0Target = rpm
@@ -100,18 +169,32 @@ final class FanController: ObservableObject {
         }
     }
 
+    /// Synchronous fan reset called on app quit. No-op (and no password prompt)
+    /// if the NOPASSWD helper isn't installed yet.
+    func resetToAutomaticOnQuit() {
+        guard helperInstalled else { return }
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+        task.arguments = [installedHelperPath, "auto"]
+        try? task.run()
+        task.waitUntilExit()
+    }
+
     private func runHelper(args: String, label: String, onSuccess: @escaping () -> Void) {
+        guard helperInstalled else {
+            warningMessage = "\(label): helper not set up — relaunch the app"
+            return
+        }
+
         DispatchQueue.global(qos: .userInitiated).async { [weak self] in
             guard let self else { return }
-            let path = self.helperPath
-            // Use osascript to prompt for admin password and run with sudo
-            let script = "do shell script \"\(path) \(args)\" with administrator privileges"
             let task = Process()
-            task.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
-            task.arguments = ["-e", script]
             let pipe = Pipe()
             task.standardOutput = pipe
             task.standardError = pipe
+
+            task.executableURL = URL(fileURLWithPath: "/usr/bin/sudo")
+            task.arguments = [self.installedHelperPath] + args.components(separatedBy: " ")
 
             do {
                 try task.run()

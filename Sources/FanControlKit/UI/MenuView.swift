@@ -94,16 +94,26 @@ struct MenuView: View {
     }
 
     private var footerButtons: some View {
-        HStack {
-            Button("Auto") { controller.resetToAutomatic() }
-                .help("Let Apple SMC manage fan speeds automatically")
-            Spacer()
-            Button("SMC Dump") { controller.copySmcDump() }
-                .help("Copy all SMC keys/types/values to clipboard for debugging")
+        VStack(spacing: 6) {
+            HStack {
+                Button("Auto") { controller.resetToAutomatic() }
+                    .help("Let Apple SMC manage fan speeds automatically")
+                Spacer()
+                Toggle("Launch at Login", isOn: Binding(
+                    get: { controller.launchAtLogin },
+                    set: { controller.setLaunchAtLogin($0) }
+                ))
+                .toggleStyle(.checkbox)
                 .font(.system(size: 11))
-                .foregroundColor(.secondary)
-            Spacer()
-            Button("Quit") { NSApp.terminate(nil) }
+            }
+            HStack {
+                Button("SMC Dump") { controller.copySmcDump() }
+                    .help("Copy all SMC keys/types/values to clipboard for debugging")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+                Spacer()
+                Button("Quit") { NSApp.terminate(nil) }
+            }
         }
         .font(.system(size: 12))
     }
