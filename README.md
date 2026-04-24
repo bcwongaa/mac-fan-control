@@ -1,10 +1,10 @@
-# Mac (M2 Pro) Fan Control
+# Mac (M2 Pro & M5 Pro) Fan Control
 
 > Because I don't wanna pay for Mac Fan Control.
 
 > A native macOS menu bar app that monitors die temperature and controls fan speeds via direct SMC access.
 
-> Fan control works on any Mac with fans. Temperature reading is currently keyed for **M2 Pro** — other chips will show `—°C` until their SMC key names are added to `SMCKeys.swift`.
+> Fan control works on any Mac with fans. Temperature reading is currently keyed for **M2 Pro** and **M5 Pro** — other chips might show `—°C` until their SMC key names are added to `SMCKeys.swift`, and set fan speed function might not be working.
 
 > Maybe more support on future mac is coming, or not.
 
