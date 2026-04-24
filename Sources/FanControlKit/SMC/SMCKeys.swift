@@ -5,24 +5,24 @@ import Foundation
 enum FanKey {
     static let count = "FNum"    // Number of fans (ui8)
 
-    // Fan 0 — left fan (on M2 Pro: flt type = 4-byte LE float)
+    // Fan 0 — left fan (flt = 4-byte LE float on Apple Silicon)
     static let fan0Actual = "F0Ac"  // Actual RPM
     static let fan0Min    = "F0Mn"  // Minimum RPM floor
     static let fan0Max    = "F0Mx"  // Maximum RPM
-    static let fan0Safe   = "F0Sf"  // Safe RPM
     static let fan0Target = "F0Tg"  // Target RPM (write here for manual control)
-    static let fan0Mode   = "F0Md"  // Fan mode: 0=auto, 1=manual, 3=system
 
     // Fan 1 — right fan
     static let fan1Actual = "F1Ac"
     static let fan1Min    = "F1Mn"
     static let fan1Max    = "F1Mx"
-    static let fan1Safe   = "F1Sf"
     static let fan1Target = "F1Tg"
-    static let fan1Mode   = "F1Md"
 
-    // Unlock key — must write 1 before manual fan control on Apple Silicon
-    static let forceTest  = "Ftst"  // ui8: 1=unlock manual mode, 0=restore auto
+    // Fan mode: 0=auto, 1=manual. Casing varies by Mac generation:
+    //   M2 Pro (Mac14,*): "F0Md" / "F1Md"  (capital M)
+    //   M5 Pro (Mac17,*): "F0md" / "F1md"  (lowercase m)
+    // Callers should probe both candidates and pick the one the SMC accepts.
+    static let fan0ModeCandidates = ["F0Md", "F0md"]
+    static let fan1ModeCandidates = ["F1Md", "F1md"]
 }
 
 // MARK: - Temperature SMC Keys (M2 Pro)

@@ -140,13 +140,24 @@ final class SMCKit {
 
     // MARK: - Debug Dump
 
+    /// Returns the first key in `candidates` that the SMC recognizes, or nil.
+    /// Used to handle SMC naming differences across Mac generations
+    /// (e.g. F0Md on M2 Pro vs F0md on M5 Pro).
+    func resolveKey(_ candidates: [String]) -> String? {
+        for k in candidates {
+            if (try? read(k)) != nil { return k }
+        }
+        return nil
+    }
+
     /// Dump only the keys we care about (fans + temps + control keys).
     func dumpAllKeys() -> String {
         guard isOpen else { return "SMC not open" }
 
         let keysToCheck = [
             "FNum", "F0Ac", "F1Ac", "F0Mn", "F1Mn", "F0Mx", "F1Mx",
-            "F0Tg", "F1Tg", "F0Md", "F1Md", "F0Sf", "F1Sf", "Ftst",
+            "F0Tg", "F1Tg", "F0Md", "F1Md", "F0md", "F1md",
+            "F0Sf", "F1Sf", "Ftst",
             "Tp01", "Tp05", "Tp09", "Tp0D", "Tp0X", "Tp0b", "Tp0f", "Tp0j",
             "Tp1h", "Tp1t", "Tp1p", "Tp1l",
             "Tg0f", "Tg0j",
@@ -186,13 +197,17 @@ final class SMCKit {
             lines.append("F0Tg write test: \(error.localizedDescription)")
         }
 
-        do {
-            try writeUInt8(key: "F0Md", value: 1)
-            lines.append("F0Md write 1 OK")
-            try writeUInt8(key: "F0Md", value: 0)
-            lines.append("F0Md write 0 OK (restored)")
-        } catch {
-            lines.append("F0Md write test: \(error.localizedDescription)")
+        if let mdKey = resolveKey(FanKey.fan0ModeCandidates) {
+            do {
+                try writeUInt8(key: mdKey, value: 1)
+                lines.append("\(mdKey) write 1 OK")
+                try writeUInt8(key: mdKey, value: 0)
+                lines.append("\(mdKey) write 0 OK (restored)")
+            } catch {
+                lines.append("\(mdKey) write test: \(error.localizedDescription)")
+            }
+        } else {
+            lines.append("Fan-mode key not found (tried \(FanKey.fan0ModeCandidates.joined(separator: ", ")))")
         }
 
         return lines.joined(separator: "\n")
