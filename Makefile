@@ -36,11 +36,7 @@ package:
 
 # ── Uninstall ─────────────────────────────────────────────────────────────────
 uninstall:
-	@rm -rf $(BUNDLE)
-	@rm -f  /usr/local/bin/FanHelper \
-		/Library/PrivilegedHelperTools/com.local.FanControl.FanHelper \
-		/etc/sudoers.d/fan-control
-	@echo "Uninstalled FanControl"
+	@./uninstall.sh
 
 # ── Tests (no SMC hardware required) ─────────────────────────────────────────
 test:

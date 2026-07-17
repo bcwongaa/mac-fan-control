@@ -63,3 +63,13 @@ jobs:
             echo "Committed prebuilt package is stale; run make package" >&2
             exit 1
           fi
+
+      - name: Smoke-test uninstaller
+        env:
+          FANCONTROL_UNINSTALL_DRY_RUN: "1"
+        run: |
+          bash -n ./uninstall.sh
+          test -x ./uninstall.sh
+          sed -n '/^on run argv$/,/^APPLESCRIPT$/p' uninstall.sh | sed '$d' \
+            | osacompile -o "${RUNNER_TEMP}/FanControlUninstall.scpt" -
+          ./uninstall.sh
