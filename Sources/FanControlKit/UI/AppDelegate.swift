@@ -20,7 +20,12 @@ public final class AppDelegate: NSObject, NSApplicationDelegate {
         setupPopover()
         startPolling()
         if !controller.helperInstalled {
-            controller.installHelper { _ in }
+            controller.installHelper { [weak self] error in
+                if let error {
+                    self?.controller.warningMessage =
+                        "Helper install: \(error.localizedDescription)"
+                }
+            }
         }
     }
 

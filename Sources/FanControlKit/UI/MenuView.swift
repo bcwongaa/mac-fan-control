@@ -32,21 +32,29 @@ struct MenuView: View {
     private var fanSection: some View {
         VStack(alignment: .leading, spacing: 8) {
             sectionHeader("Fan Speed", icon: "fan")
-            fanSlider(
-                label: "Left",
-                actual: controller.fan0RPM,
-                target: $controller.fan0Target,
-                min: controller.fan0Min,
-                max: controller.fan0Max
-            ) { controller.setFan0Speed($0) }
+            if controller.hasFan0Control {
+                fanSlider(
+                    label: controller.fanCount == 1 ? "Fan" : "Left",
+                    actual: controller.fan0RPM,
+                    target: $controller.fan0Target,
+                    min: controller.fan0Min,
+                    max: controller.fan0Max
+                ) { controller.setFan0Speed($0) }
+            } else {
+                Text("Manual fan controls unavailable")
+                    .font(.system(size: 11))
+                    .foregroundColor(.secondary)
+            }
 
-            fanSlider(
-                label: "Right",
-                actual: controller.fan1RPM,
-                target: $controller.fan1Target,
-                min: controller.fan1Min,
-                max: controller.fan1Max
-            ) { controller.setFan1Speed($0) }
+            if controller.hasFan1Control {
+                fanSlider(
+                    label: "Right",
+                    actual: controller.fan1RPM,
+                    target: $controller.fan1Target,
+                    min: controller.fan1Min,
+                    max: controller.fan1Max
+                ) { controller.setFan1Speed($0) }
+            }
         }
     }
 
