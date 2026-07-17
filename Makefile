@@ -5,7 +5,7 @@ MACOS    = $(BUNDLE)/Contents/MacOS
 
 SOURCES  = $(shell find Sources -name "*.swift")
 
-.PHONY: all run install uninstall clean test
+.PHONY: all run install install-prebuilt package uninstall clean test
 
 # ── Build ─────────────────────────────────────────────────────────────────────
 all:
@@ -25,6 +25,14 @@ install: all
 	@cp $(BUILD)/release/FanHelper  $(MACOS)/
 	@echo "Installed: $(BUNDLE)"
 	@echo "Open with: open $(BUNDLE)"
+
+# Installs the committed arm64 package without requiring Xcode or Swift.
+install-prebuilt:
+	@./install.sh
+
+# Builds the distributable app archive and SHA-256 checksum in dist/.
+package:
+	@./Scripts/package-release.sh
 
 # ── Uninstall ─────────────────────────────────────────────────────────────────
 uninstall:

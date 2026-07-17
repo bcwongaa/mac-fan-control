@@ -1,0 +1,61 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  release:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tags must use vMAJOR.MINOR.PATCH" >&2
+            exit 1
+          fi
+          plist_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
+          if [[ "${version}" != "${plist_version}" ]]; then
+            echo "Tag ${GITHUB_REF_NAME} does not match Info.plist version ${plist_version}" >&2
+            exit 1
+          fi
+
+      - name: Select Xcode
+        run: sudo xcode-select --switch /Applications/Xcode_16.4.app/Contents/Developer
+
+      - name: Run tests
+        run: swift test --disable-automatic-resolution
+
+      - name: Build release package
+        run: ./Scripts/package-release.sh dist
+
+      - name: Attest release archive
+        uses: actions/attest@f7c74d28b9d84cb8768d0b8ca14a4bac6ef463e6 # v4
+        with:
+          subject-path: dist/FanControl-macos-arm64.zip
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/FanControl-macos-arm64.zip \
+            dist/FanControl-macos-arm64.zip.sha256 \
+            --verify-tag \
+            --generate-notes \
+            --title "FanControl ${GITHUB_REF_NAME}"
