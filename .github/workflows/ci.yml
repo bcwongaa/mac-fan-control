@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-and-package:
+    runs-on: macos-15
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          persist-credentials: false
+
+      - name: Select Xcode
+        run: sudo xcode-select --switch /Applications/Xcode_16.4.app/Contents/Developer
+
+      - name: Show toolchain
+        run: |
+          xcodebuild -version
+          swift --version
+          uname -m
+
+      - name: Run tests
+        run: swift test --disable-automatic-resolution
+
+      - name: Verify committed prebuilt installer
+        env:
+          FANCONTROL_INSTALL_DIR: ${{ runner.temp }}/prebuilt-install
+          FANCONTROL_NO_OPEN: "1"
+        run: ./install.sh
+
+      - name: Build and package release from source
+        run: ./Scripts/package-release.sh "${RUNNER_TEMP}/release"
+
+      - name: Smoke-test freshly packaged installer
+        env:
+          FANCONTROL_DIST_DIR: ${{ runner.temp }}/release
+          FANCONTROL_INSTALL_DIR: ${{ runner.temp }}/source-install
+          FANCONTROL_NO_OPEN: "1"
+        run: ./install.sh
+
+      - name: Verify prebuilt source fingerprint
+        run: |
+          committed_plist="${RUNNER_TEMP}/prebuilt-install/FanControl.app/Contents/Info.plist"
+          source_plist="${RUNNER_TEMP}/source-install/FanControl.app/Contents/Info.plist"
+          committed_hash="$(/usr/libexec/PlistBuddy -c 'Print :FanControlSourceSHA256' "${committed_plist}")"
+          source_hash="$(/usr/libexec/PlistBuddy -c 'Print :FanControlSourceSHA256' "${source_plist}")"
+          if [[ "${committed_hash}" != "${source_hash}" ]]; then
+            echo "Committed prebuilt package is stale; run make package" >&2
+            exit 1
+          fi
