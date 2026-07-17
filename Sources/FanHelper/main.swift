@@ -4,11 +4,11 @@
 ///   set-fan <fan:0|1> <rpm>    — set F{fan} mode to manual, F{fan}Tg to rpm
 ///   auto                        — restore auto mode on both fans
 ///
-/// Fan-mode key casing differs across Mac generations:
-///   M2 Pro (Mac14,*): F0Md / F1Md  (capital M)
-///   M5 Pro (Mac17,*): F0md / F1md  (lowercase m)
-/// We resolve the actual key at runtime by probing both candidates.
+/// Hardware differences are resolved at runtime: fan count, mode-key casing,
+/// target datatype, and the optional Ftst unlock are all probed before writes.
+import Darwin
 import Foundation
+import FanControlCore
 import IOKit
 
 // MARK: - SMC raw I/O (same logic as SMCKit, inlined for standalone binary)
@@ -55,12 +55,26 @@ func rawCall(_ input: [UInt8]) -> (Int32, [UInt8]) {
     return (kr, out)
 }
 
-func smcRead(_ key: String) -> (type: String, bytes: [UInt8])? {
+func smcRead(_ key: String) throws -> (type: String, bytes: [UInt8]) {
     var buf = [UInt8](repeating: 0, count: kBufSize)
     setNat32(&buf, Off.key, fourCC(key))
     buf[Off.data8] = 9 // getKeyInfo
     let (kr1, out1) = rawCall(buf)
-    guard kr1 == kIOReturnSuccess, out1[Off.result] == 0 else { return nil }
+    guard kr1 == kIOReturnSuccess else {
+        throw RawSMCError(
+            message: "\(key): getKeyInfo kr=" +
+                String(format: "0x%X", UInt32(bitPattern: kr1))
+        )
+    }
+    if out1[Off.result] == 0x84 {
+        throw SMCKeyUnavailableError(key: key)
+    }
+    guard out1[Off.result] == 0 else {
+        throw RawSMCError(
+            message: "\(key): getKeyInfo result=" +
+                String(format: "0x%X", out1[Off.result])
+        )
+    }
 
     let dataSize = getNat32(out1, Off.infoSize)
     let codeStr: String = {
@@ -74,7 +88,21 @@ func smcRead(_ key: String) -> (type: String, bytes: [UInt8])? {
     setNat32(&buf, Off.infoSize, dataSize)
     buf[Off.data8] = 5 // readKey
     let (kr2, out2) = rawCall(buf)
-    guard kr2 == kIOReturnSuccess, out2[Off.result] == 0 else { return nil }
+    guard kr2 == kIOReturnSuccess else {
+        throw RawSMCError(
+            message: "\(key): read kr=" +
+                String(format: "0x%X", UInt32(bitPattern: kr2))
+        )
+    }
+    if out2[Off.result] == 0x84 {
+        throw SMCKeyUnavailableError(key: key)
+    }
+    guard out2[Off.result] == 0 else {
+        throw RawSMCError(
+            message: "\(key): read result=" +
+                String(format: "0x%X", out2[Off.result])
+        )
+    }
     return (codeStr, Array(out2[Off.dataBytes ..< min(Off.dataBytes + Int(dataSize), kBufSize)]))
 }
 
@@ -111,66 +139,210 @@ func smcWrite(_ key: String, bytes: [UInt8]) -> String? {
     return nil
 }
 
-/// Picks the first existing key from a list of candidates. Lets us cope with
-/// SMC naming changes across Mac generations (e.g. F0Md on M2 Pro vs F0md on M5 Pro).
-func resolveKey(_ candidates: [String]) -> String? {
-    for k in candidates where smcRead(k) != nil { return k }
-    return nil
+private struct RawSMCError: Error, LocalizedError {
+    let message: String
+    var errorDescription: String? { message }
 }
 
-func encodeFLT(_ value: Double) -> [UInt8] {
-    let raw = Float(value).bitPattern
-    return [UInt8(raw & 0xFF), UInt8((raw >> 8) & 0xFF),
-            UInt8((raw >> 16) & 0xFF), UInt8((raw >> 24) & 0xFF)]
+private final class RawFanSMCClient: FanSMCClient {
+    func read(_ key: String) throws -> SMCValue {
+        let value = try smcRead(key)
+        return SMCValue(dataType: value.type, bytes: value.bytes)
+    }
+
+    func write(_ key: String, bytes: [UInt8]) throws {
+        if let error = smcWrite(key, bytes: bytes) {
+            throw RawSMCError(message: "\(key): \(error)")
+        }
+    }
+}
+
+private func writeServerResponse(ok: Bool, message: String) -> Bool {
+    let sanitized = message
+        .replacingOccurrences(of: "\t", with: " ")
+        .replacingOccurrences(of: "\r", with: " ")
+        .replacingOccurrences(of: "\n", with: " ")
+    let line = "\(ok ? "OK" : "ERR")\t\(sanitized)\n"
+    do {
+        try FileHandle.standardOutput.write(contentsOf: Data(line.utf8))
+        return true
+    } catch {
+        return false
+    }
+}
+
+private enum ServerInput {
+    case line(String)
+    case timeout
+    case end
+}
+
+private func readServerInput(timeout: TimeInterval) -> ServerInput {
+    let deadline = DispatchTime.now().uptimeNanoseconds +
+        UInt64(max(0, timeout) * 1_000_000_000)
+    var data = Data()
+
+    while data.count < 16_384 {
+        let now = DispatchTime.now().uptimeNanoseconds
+        guard now < deadline else { return .timeout }
+        let remainingMilliseconds = min(
+            UInt64(Int32.max),
+            max(1, (deadline - now) / 1_000_000)
+        )
+        var descriptor = pollfd(
+            fd: STDIN_FILENO,
+            events: Int16(POLLIN | POLLHUP | POLLERR),
+            revents: 0
+        )
+        let pollResult = Darwin.poll(
+            &descriptor,
+            1,
+            Int32(remainingMilliseconds)
+        )
+        if pollResult == 0 { return .timeout }
+        if pollResult < 0 {
+            if errno == EINTR { continue }
+            return .end
+        }
+
+        var byte: UInt8 = 0
+        let count = withUnsafeMutableBytes(of: &byte) { buffer in
+            Darwin.read(STDIN_FILENO, buffer.baseAddress, 1)
+        }
+        if count == 0 { return .end }
+        if count < 0 {
+            if errno == EINTR { continue }
+            return .end
+        }
+        if byte == 0x0A {
+            guard let line = String(data: data, encoding: .utf8) else { return .end }
+            return .line(line)
+        }
+        data.append(byte)
+    }
+    return .end
+}
+
+private func restoreAutomaticWithRetries(
+    _ runner: FanCommandRunner
+) -> Result<String, Error> {
+    var lastError: Error = RawSMCError(message: "Automatic reset did not run")
+    for attempt in 0..<3 {
+        do {
+            return .success(try runner.run(arguments: ["auto"]))
+        } catch {
+            lastError = error
+            if attempt < 2 { Thread.sleep(forTimeInterval: 0.1) }
+        }
+    }
+    return .failure(lastError)
+}
+
+private func restoreAutomaticBeforeExit(_ runner: FanCommandRunner) -> Int32 {
+    switch restoreAutomaticWithRetries(runner) {
+    case .success:
+        return 0
+    case let .failure(error):
+        fputs("Automatic fan recovery failed: \(error.localizedDescription)\n", stderr)
+        return 1
+    }
+}
+
+private func runServer(_ runner: FanCommandRunner) -> Int32 {
+    signal(SIGPIPE, SIG_IGN)
+
+    while true {
+        let line: String
+        switch readServerInput(timeout: 12) {
+        case let .line(value): line = value
+        case .timeout, .end:
+            return restoreAutomaticBeforeExit(runner)
+        }
+
+        let arguments = line.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+
+        if arguments == ["heartbeat"] {
+            guard writeServerResponse(ok: true, message: "alive") else {
+                return restoreAutomaticBeforeExit(runner)
+            }
+            continue
+        }
+
+        if arguments == ["shutdown"] {
+            switch restoreAutomaticWithRetries(runner) {
+            case let .success(output):
+                _ = writeServerResponse(ok: true, message: output)
+                return 0
+            case let .failure(error):
+                _ = writeServerResponse(ok: false, message: error.localizedDescription)
+                return 1
+            }
+        }
+
+        do {
+            let output = try runner.run(arguments: arguments)
+            guard writeServerResponse(ok: true, message: output) else {
+                return restoreAutomaticBeforeExit(runner)
+            }
+        } catch {
+            guard writeServerResponse(ok: false, message: error.localizedDescription) else {
+                return restoreAutomaticBeforeExit(runner)
+            }
+        }
+    }
+}
+
+private func verifyInstallation() -> Bool {
+    guard geteuid() == 0,
+          URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path ==
+            FanHelperInstallation.executablePath,
+          let rule = try? String(
+              contentsOfFile: FanHelperInstallation.sudoersPath,
+              encoding: .utf8
+          ),
+          rule == FanHelperInstallation.sudoersRule + "\n",
+          let attributes = try? FileManager.default.attributesOfItem(
+              atPath: FanHelperInstallation.sudoersPath
+          ),
+          let owner = attributes[.ownerAccountID] as? NSNumber,
+          let permissions = attributes[.posixPermissions] as? NSNumber else {
+        return false
+    }
+    return owner.intValue == 0 && permissions.intValue == 0o440
 }
 
 // MARK: - Main
 
+let arguments = Array(CommandLine.arguments.dropFirst())
+let runningFromInstalledPath =
+    URL(fileURLWithPath: CommandLine.arguments[0]).resolvingSymlinksInPath().path ==
+    FanHelperInstallation.executablePath
+if arguments == ["verify-install"] {
+    guard verifyInstallation() else { exit(1) }
+    print(FanHelperInstallation.verificationToken)
+    exit(0)
+}
+if runningFromInstalledPath, arguments != ["serve"] {
+    fputs("Installed FanHelper only accepts the leased server protocol\n", stderr)
+    exit(1)
+}
+
 guard openSMC() else { fputs("Failed to open SMC\n", stderr); exit(1) }
 
-let args = CommandLine.arguments
-guard args.count >= 2 else {
-    fputs("Usage: FanHelper set-fan <0|1> <rpm> | auto\n", stderr); exit(1)
-}
+let runner = FanCommandRunner(client: RawFanSMCClient())
+var exitCode: Int32 = 0
 
-func modeKey(forFan fan: Int) -> String? {
-    resolveKey(["F\(fan)Md", "F\(fan)md"])
-}
-
-switch args[1] {
-case "set-fan":
-    guard args.count >= 4, let fan = Int(args[2]), let rpm = Double(args[3]) else {
-        fputs("Usage: FanHelper set-fan <0|1> <rpm>\n", stderr); exit(1)
+if arguments == ["serve"] {
+    exitCode = runServer(runner)
+} else {
+    do {
+        let output = try runner.run(arguments: arguments)
+        print(output)
+    } catch {
+        fputs("\(error.localizedDescription)\n", stderr)
+        exitCode = 1
     }
-    guard let mdKey = modeKey(forFan: fan) else {
-        fputs("No fan-mode SMC key found for fan \(fan) (tried F\(fan)Md, F\(fan)md)\n", stderr); exit(1)
-    }
-    let tgKey = "F\(fan)Tg"
-
-    if let err = smcWrite(mdKey, bytes: [1]) {
-        fputs("Failed to set \(mdKey)=1: \(err)\n", stderr); exit(1)
-    }
-    if let err = smcWrite(tgKey, bytes: encodeFLT(rpm)) {
-        fputs("Failed to set \(tgKey)=\(rpm): \(err)\n", stderr); exit(1)
-    }
-    print("OK: \(mdKey)=1 \(tgKey)=\(rpm)")
-
-case "auto":
-    var msgs: [String] = []
-    for fan in 0..<2 {
-        guard let mdKey = modeKey(forFan: fan) else {
-            msgs.append("fan \(fan): no mode key"); continue
-        }
-        if let err = smcWrite(mdKey, bytes: [0]) {
-            msgs.append("\(mdKey)=0 failed: \(err)")
-        } else {
-            msgs.append("\(mdKey)=0")
-        }
-    }
-    print("OK: " + msgs.joined(separator: ", "))
-
-default:
-    fputs("Unknown command: \(args[1])\n", stderr); exit(1)
 }
 
 IOServiceClose(connection)
+if exitCode != 0 { exit(exitCode) }

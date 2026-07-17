@@ -14,10 +14,17 @@ let package = Package(
         .package(url: "https://github.com/swiftlang/swift-testing.git", from: "0.10.0"),
     ],
     targets: [
+        // Hardware-independent SMC rules shared by the app and privileged helper.
+        .target(
+            name: "FanControlCore",
+            path: "Sources/FanControlCore"
+        ),
+
         // Core library — contains all SMC, Model, and UI code.
         // Separated from the executable so the test target can depend on it.
         .target(
             name: "FanControlKit",
+            dependencies: ["FanControlCore"],
             path: "Sources/FanControlKit",
             linkerSettings: [
                 .linkedFramework("AppKit"),
@@ -39,6 +46,7 @@ let package = Package(
         // Privileged helper — runs via sudo to write SMC fan keys.
         .executableTarget(
             name: "FanHelper",
+            dependencies: ["FanControlCore"],
             path: "Sources/FanHelper",
             linkerSettings: [
                 .linkedFramework("IOKit"),
@@ -49,6 +57,7 @@ let package = Package(
         .testTarget(
             name: "FanControlKitTests",
             dependencies: [
+                "FanControlCore",
                 "FanControlKit",
                 .product(name: "Testing", package: "swift-testing"),
             ],
