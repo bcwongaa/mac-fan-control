@@ -33,19 +33,22 @@ public struct FanControlTiming: Sendable {
     public let maxAttempts: Int
     public let modeVerificationDelay: TimeInterval
     public let directResponseAttempts: Int
+    public let readbackSettleAttempts: Int
 
     public init(
         settleDelay: TimeInterval = 0.5,
         retryDelay: TimeInterval = 0.1,
         maxAttempts: Int = 100,
         modeVerificationDelay: TimeInterval = 0.1,
-        directResponseAttempts: Int = 10
+        directResponseAttempts: Int = 10,
+        readbackSettleAttempts: Int = 20
     ) {
         self.settleDelay = settleDelay
         self.retryDelay = retryDelay
         self.maxAttempts = maxAttempts
         self.modeVerificationDelay = modeVerificationDelay
         self.directResponseAttempts = directResponseAttempts
+        self.readbackSettleAttempts = readbackSettleAttempts
     }
 }
 
@@ -229,13 +232,14 @@ public final class FanCommandRunner {
             fans.formUnion(0...1)
         }
 
+        var pendingFans: [Int: Error] = [:]
         for fan in fans.sorted() {
             do {
                 try restoreAutomaticMode(for: fan)
                 manualFans.remove(fan)
                 manualModeKeys.removeValue(forKey: fan)
             } catch {
-                failures.append("fan \(fan): \(error.localizedDescription)")
+                pendingFans[fan] = error
             }
         }
 
@@ -259,6 +263,17 @@ public final class FanCommandRunner {
                 break
             case let .failed(error):
                 failures.append("Ftst probe: \(error.localizedDescription)")
+            }
+        }
+
+        // M4 rejects mode writes while Ftst is clear, so a fan whose mode
+        // write failed may still have returned to automatic once Ftst reset.
+        for (fan, error) in pendingFans.sorted(by: { $0.key < $1.key }) {
+            if modeKeysAreAutomatic(for: fan) {
+                manualFans.remove(fan)
+                manualModeKeys.removeValue(forKey: fan)
+            } else {
+                failures.append("fan \(fan): \(error.localizedDescription)")
             }
         }
 
@@ -384,7 +399,7 @@ public final class FanCommandRunner {
 
         do {
             try client.write(FanKey.forceTest, bytes: [1])
-            guard try readUInt8(FanKey.forceTest) == 1 else {
+            guard try waitForForceTest(1) else {
                 throw FanVerificationError("Ftst write was not retained")
             }
         } catch {
@@ -441,10 +456,23 @@ public final class FanCommandRunner {
 
     private func disableForceTest() throws {
         try client.write(FanKey.forceTest, bytes: [0])
-        guard try readUInt8(FanKey.forceTest) == 0 else {
+        guard try waitForForceTest(0) else {
             throw FanVerificationError("Ftst reset was not retained")
         }
         ownsForceTest = false
+    }
+
+    /// Some SMCs (observed on M4) accept an Ftst write but only report the
+    /// new value roughly half a second later, so poll before giving up.
+    private func waitForForceTest(_ value: UInt8) throws -> Bool {
+        let attempts = max(1, timing.readbackSettleAttempts)
+        for attempt in 0..<attempts {
+            if try readUInt8(FanKey.forceTest) == value { return true }
+            if attempt + 1 < attempts, timing.retryDelay > 0 {
+                sleep(timing.retryDelay)
+            }
+        }
+        return false
     }
 
     private func writeAndVerifyMode(_ key: String, value: UInt8) throws {
@@ -471,21 +499,31 @@ public final class FanCommandRunner {
         bytes: [UInt8]
     ) throws {
         try client.write(key, bytes: bytes)
-        let confirmed = try client.read(key)
-        guard confirmed.dataType.trimmingCharacters(in: .whitespacesAndNewlines) ==
-                dataType.trimmingCharacters(in: .whitespacesAndNewlines) else {
-            throw FanVerificationError("\(key) datatype changed during write")
-        }
-        let confirmedRPM = try SMCDataCodec.decodeFanRPM(
-            confirmed.bytes,
-            dataType: confirmed.dataType
-        )
-        guard confirmedRPM.isFinite,
-              abs(confirmedRPM - rpm) <= Self.targetTolerance else {
-            throw FanVerificationError(
-                "\(key) read back \(confirmedRPM) RPM, expected \(rpm)"
+
+        // M4 reports the previous target for roughly half a second after an
+        // accepted write, so poll before treating the write as rejected.
+        let attempts = max(1, timing.readbackSettleAttempts)
+        var confirmedRPM = Double.nan
+        for attempt in 0..<attempts {
+            let confirmed = try client.read(key)
+            guard confirmed.dataType.trimmingCharacters(in: .whitespacesAndNewlines) ==
+                    dataType.trimmingCharacters(in: .whitespacesAndNewlines) else {
+                throw FanVerificationError("\(key) datatype changed during write")
+            }
+            confirmedRPM = try SMCDataCodec.decodeFanRPM(
+                confirmed.bytes,
+                dataType: confirmed.dataType
             )
+            if confirmedRPM.isFinite, abs(confirmedRPM - rpm) <= Self.targetTolerance {
+                return
+            }
+            if attempt + 1 < attempts, timing.retryDelay > 0 {
+                sleep(timing.retryDelay)
+            }
         }
+        throw FanVerificationError(
+            "\(key) read back \(confirmedRPM) RPM, expected \(rpm)"
+        )
     }
 
     private func verifyActualResponse(
@@ -549,12 +587,28 @@ public final class FanCommandRunner {
             do {
                 try writeAndVerifyMode(modeKey, value: 0)
             } catch {
+                // M4 rejects every mode write (0x82) while Ftst is clear,
+                // including one that would leave an automatic fan unchanged.
+                if modeIsAutomatic(modeKey) { continue }
                 failures.append("\(modeKey): \(error.localizedDescription)")
             }
         }
         if !failures.isEmpty {
             throw FanVerificationError(failures.joined(separator: "; "))
         }
+    }
+
+    private func modeIsAutomatic(_ key: String) -> Bool {
+        guard let value = try? readUInt8(key) else { return false }
+        return [0, 3].contains(value)
+    }
+
+    private func modeKeysAreAutomatic(for fan: Int) -> Bool {
+        var modeKeys = readableModeKeys(for: fan)
+        if let trackedKey = manualModeKeys[fan], !modeKeys.contains(trackedKey) {
+            modeKeys.append(trackedKey)
+        }
+        return !modeKeys.isEmpty && modeKeys.allSatisfy(modeIsAutomatic)
     }
 
     private func readUInt8(_ key: String) throws -> UInt8 {

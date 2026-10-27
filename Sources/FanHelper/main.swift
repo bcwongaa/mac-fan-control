@@ -1,11 +1,16 @@
 /// FanHelper — tiny CLI tool that writes SMC fan keys.
-/// Invoked by the main app via "sudo FanHelper <command> [args...]"
+/// The app runs the installed helper as "sudo FanHelper serve" and sends one
+/// command per line over stdin; uninstalled builds also accept the command as
+/// arguments ("FanHelper <command> [args...]") for local debugging.
 /// Commands:
-///   set-fan <fan:0|1> <rpm>    — set F{fan} mode to manual, F{fan}Tg to rpm
-///   auto                        — restore auto mode on both fans
+///   set-fan <fan> <rpm>   — set F{fan} mode to manual, F{fan}Tg to rpm
+///   auto                  — restore auto mode on every reported fan
 ///
 /// Hardware differences are resolved at runtime: fan count, mode-key casing,
 /// target datatype, and the optional Ftst unlock are all probed before writes.
+/// M4-class SMCs reject every mode write until Ftst=1 has settled and report
+/// Ftst/F{fan}Tg writes late, so the runner retries mode writes, polls
+/// read-backs, and tolerates rejected resets of already-automatic fans.
 import Darwin
 import Foundation
 import FanControlCore
