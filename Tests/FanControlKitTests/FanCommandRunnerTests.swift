@@ -308,6 +308,53 @@ struct FanCommandRunnerTests {
         #expect(client.writes.contains { $0.key == FanKey.forceTest && $0.bytes == [0] })
     }
 
+    @Test func m4AutoAcceptsRejectedWriteWhenModeIsAlreadyAutomatic() throws {
+        let client = makeM4Client()
+        let runner = makeRunner(client)
+
+        _ = try runner.run(arguments: ["auto"])
+
+        #expect(client.values["F0Md"]?.bytes == [3])
+        #expect(client.values[FanKey.forceTest]?.bytes == [0])
+    }
+
+    @Test func m4SetFanWaitsForDelayedForceTestAndRestores() throws {
+        let client = makeM4Client()
+        let runner = FanCommandRunner(
+            client: client,
+            timing: FanControlTiming(
+                settleDelay: 0,
+                retryDelay: 0,
+                maxAttempts: 3,
+                readbackSettleAttempts: 10
+            ),
+            sleep: { _ in }
+        )
+
+        _ = try runner.run(arguments: ["auto"])
+        _ = try runner.run(arguments: ["set-fan", "0", "3000"])
+
+        #expect(client.values["F0Md"]?.bytes == [1])
+        #expect(client.values[FanKey.forceTest]?.bytes == [1])
+
+        _ = try runner.run(arguments: ["auto"])
+
+        #expect(client.values["F0Md"]?.bytes == [0])
+        #expect(client.values[FanKey.forceTest]?.bytes == [0])
+        #expect(client.writes.suffix(2).map(\.key) == ["F0Md", FanKey.forceTest])
+    }
+
+    @Test func autoStillFailsWhenRejectedModeRemainsManual() {
+        let client = makeM4Client()
+        client.values["F0Md"] = SMCValue(dataType: "ui8 ", bytes: [1])
+        client.forceTestReadDelay = 0
+        let runner = makeRunner(client)
+
+        #expect(throws: (any Error).self) {
+            _ = try runner.run(arguments: ["auto"])
+        }
+    }
+
     @Test func fanCountRequiresAUi8Value() {
         let client = makeClient(modeKey: "F0Md")
         client.values[FanKey.count] = SMCValue(dataType: "flt ", bytes: [1, 0, 0, 0])
@@ -354,6 +401,14 @@ private final class FakeFanSMCClient: FanSMCClient {
     var failForceTestDisableWrites = false
     var pendingForceTestReadFailures = 0
     var failTargetWrites = false
+    /// M4: every mode write is rejected unless Ftst reads 1.
+    var modeWritesRequireForceTest = false
+    /// M4: Ftst writes become visible only after this many reads.
+    var forceTestReadDelay = 0
+    private var staleForceTest: (value: SMCValue, remainingReads: Int)?
+    /// M4: F<n>Tg writes become visible only after this many reads.
+    var targetReadDelay = 0
+    private var staleTargets: [String: (value: SMCValue, remainingReads: Int)] = [:]
 
     init(values: [String: SMCValue]) {
         self.values = values
@@ -363,6 +418,18 @@ private final class FakeFanSMCClient: FanSMCClient {
         if key == FanKey.forceTest, pendingForceTestReadFailures > 0 {
             pendingForceTestReadFailures -= 1
             throw FakeSMCError()
+        }
+        if key.hasSuffix("Tg"), let stale = staleTargets[key] {
+            staleTargets[key] = stale.remainingReads > 1
+                ? (stale.value, stale.remainingReads - 1)
+                : nil
+            return stale.value
+        }
+        if key == FanKey.forceTest, let stale = staleForceTest {
+            staleForceTest = stale.remainingReads > 1
+                ? (stale.value, stale.remainingReads - 1)
+                : nil
+            return stale.value
         }
         guard let value = values[key] else {
             throw SMCKeyUnavailableError(key: key)
@@ -378,6 +445,18 @@ private final class FakeFanSMCClient: FanSMCClient {
             throw FakeSMCError()
         }
         if failTargetWrites && key.hasSuffix("Tg") { throw FakeSMCError() }
+        if modeWritesRequireForceTest && key.lowercased().hasSuffix("md"),
+           values[FanKey.forceTest]?.bytes != [1] {
+            throw FakeSMCError()
+        }
+        if key == FanKey.forceTest, forceTestReadDelay > 0,
+           let previous = values[key], previous.bytes != bytes {
+            staleForceTest = (previous, forceTestReadDelay)
+        }
+        if key.hasSuffix("Tg"), targetReadDelay > 0,
+           let previous = values[key], previous.bytes != bytes {
+            staleTargets[key] = (previous, targetReadDelay)
+        }
         if modeRequiresForceTest && key.lowercased().hasSuffix("md") && bytes == [1],
            values["Ftst"]?.bytes != [1] {
             throw FakeSMCError()
@@ -442,5 +521,14 @@ private func makeTwoFanClient() -> FakeFanSMCClient {
     client.values["F1Mx"] = SMCValue(dataType: "flt ", bytes: try! SMCDataCodec.encodeFanRPM(6000, dataType: "flt "))
     client.values["F1Tg"] = SMCValue(dataType: "flt ", bytes: try! SMCDataCodec.encodeFanRPM(2000, dataType: "flt "))
     client.values["F1Ac"] = SMCValue(dataType: "flt ", bytes: try! SMCDataCodec.encodeFanRPM(0, dataType: "flt "))
+    return client
+}
+
+private func makeM4Client() -> FakeFanSMCClient {
+    let client = makeClient(modeKey: "F0Md", forceTestAvailable: true)
+    client.values["F0Md"] = SMCValue(dataType: "ui8 ", bytes: [3])
+    client.modeWritesRequireForceTest = true
+    client.forceTestReadDelay = 3
+    client.targetReadDelay = 3
     return client
 }

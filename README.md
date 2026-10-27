@@ -18,7 +18,7 @@ FanControl is designed for fan-equipped Apple Silicon MacBook Pro models running
 
 The one-fan 13-inch M2 and base-chip 14-inch models are handled alongside the two-fan 14-inch and 16-inch Pro/Max models. Fan layouts are detected at runtime. Fanless MacBook Air models do not expose manual fan controls.
 
-Physical fan-control testing has been done on 14-inch M2 Pro and M5 Pro MacBook Pros. Support for the other models is based on Apple repair information, physical SMC reports from the community, runtime probing, and hardware-independent regression tests. Hardware reports and fixes are welcome.
+Physical fan-control testing has been done on 14-inch M2 Pro, base M4 (one fan), and M5 Pro MacBook Pros. Support for the other models is based on Apple repair information, physical SMC reports from the community, runtime probing, and hardware-independent regression tests. Hardware reports and fixes are welcome.
 
 ## Read this before installing
 
@@ -75,6 +75,25 @@ bash /tmp/fancontrol-uninstall.sh
 From a repository checkout, run `./uninstall.sh` instead.
 
 Saved profiles under `~/Library/Application Support/FanControl` are retained so a later reinstall can reuse them.
+
+## How fan control works
+
+The helper probes each Mac at runtime instead of hard-coding per-model behavior:
+
+- **Fan layout** comes from `FNum`, and each fan's range from `F<n>Mn`/`F<n>Mx`.
+- **Manual mode** is entered by writing `1` to `F<n>Md` (or the lowercase `F<n>md` alias), then the target RPM to `F<n>Tg`, encoded in the key's reported data type. The helper confirms the target was retained and that the measured `F<n>Ac` RPM responds.
+- **The `Ftst` unlock** is used when the SMC rejects a direct mode write or the fan ignores the target. On the tested M4, `thermalmonitord` releases the fan only after `Ftst=1` has been held for about 5 seconds, so the helper keeps retrying the mode write for up to about 10 seconds. The first slider change can therefore take several seconds to take effect; later changes are immediate while the fan stays in manual mode.
+- **Automatic control** is restored by writing `0` to each mode key and then clearing `Ftst`. A mode value of `0` or `3` counts as automatic.
+
+Hardware quirks handled on M4 (observed on a 14-inch M4, `Mac16,1`):
+
+- Every `F0Md` write, including writing `0` while the fan is already automatic, fails with SMC result `0x82` unless `Ftst` reads `1`. The helper treats a rejected write as success when the mode already reads automatic.
+- Accepted `Ftst` and `F0Tg` writes can take about half a second to read back; until then the SMC reports the previous value (for `F0Tg`, often the minimum RPM). The helper polls for up to 2 seconds before reporting a write as not retained.
+
+## Troubleshooting
+
+- **`F0Md: write result=0x82`, `Ftst write was not retained`, or `F0Tg read back 2317.0 RPM, expected …`**: these errors come from helper builds older than 0.1.1 running on M4-class SMCs. Update to 0.1.1 or newer by rerunning the installer (it prefers the latest GitHub Release, so check that the release is 0.1.1 or newer) or by running `make install` from a checkout. FanControl asks for administrator approval and replaces the privileged helper on its next launch.
+- **Collecting a hardware report**: enable the read-only SMC dump (see [Development](#development)) and include its output, your model identifier (`sysctl -n hw.model`), and the exact error text in an issue.
 
 ## Development
 
